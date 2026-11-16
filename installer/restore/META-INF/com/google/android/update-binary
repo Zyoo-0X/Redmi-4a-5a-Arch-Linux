@@ -1,0 +1,167 @@
+#!/sbin/sh
+# Riva Android Restore Prep. Restores Android filesystems, not the GPT.
+# It intentionally leaves boot/recovery/vendor/persist/modem partitions untouched.
+
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+ui_print() { printf 'ui_print %s\nui_print\n' "$1" > "$OUTFD"; }
+case "$ZIPFILE" in /sdcard/*|/data/*|/storage/emulated/*) ui_print "ERROR: This ZIP formats userdata. Flash through ADB Sideload or USB OTG, not internal storage."; exit 1 ;; esac
+abort() { ui_print "ERROR: $1"; ui_print "If formatting has begun, do not reboot to Android; repeat this ZIP only after checking recovery logs."; exit 1; }
+find_part() {
+  part="$1"
+  for base in /dev/block/bootdevice/by-name /dev/block/platform/*/by-name /dev/block/by-name; do
+    candidate="$base/$part"
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    resolved=$(readlink -f "$candidate" 2>/dev/null)
+    [ -n "$resolved" ] || resolved="$candidate"
+    [ -b "$resolved" ] && { echo "$resolved"; return 0; }
+  done
+  return 1
+}
+
+ui_print " "
+ui_print "Riva Android Restore Prep (v2 - mkfs fix)"
+ui_print "Target: Xiaomi Redmi 5A (riva)"
+ui_print " "
+DEVICE=""
+for key in ro.product.device ro.build.product ro.product.name; do
+  value=$(getprop "$key" 2>/dev/null)
+  case "$value" in riva|riva_in) DEVICE=riva; break ;; esac
+done
+[ "$DEVICE" = riva ] || abort "Device is not identified as Redmi 5A (riva)."
+[ -b /dev/block/mmcblk0 ] || abort "Internal eMMC is missing."
+SYSTEM_DEV=$(find_part system) || abort "Cannot find by-name/system."
+DATA_DEV=$(find_part userdata) || abort "Cannot find by-name/userdata."
+case "$SYSTEM_DEV" in /dev/block/mmcblk0p*) ;; *) abort "system is not on internal eMMC." ;; esac
+case "$DATA_DEV" in /dev/block/mmcblk0p*) ;; *) abort "userdata is not on internal eMMC." ;; esac
+[ "$SYSTEM_DEV" != "$DATA_DEV" ] || abort "system and userdata aliases overlap."
+SYSTEM_SECTORS=$(blockdev --getsz "$SYSTEM_DEV" 2>/dev/null || echo 0)
+DATA_SECTORS=$(blockdev --getsz "$DATA_DEV" 2>/dev/null || echo 0)
+[ "$SYSTEM_SECTORS" -ge 131072 ] || abort "System partition size is invalid."
+[ "$DATA_SECTORS" -ge 4194304 ] || abort "Userdata partition size is invalid."
+
+ui_print "This will erase the Linux root filesystem and boot files."
+ui_print "The GPT layout is unchanged; the original Android partitions are reused."
+ui_print "After this ZIP, restore your TWRP backup OR flash an Android ROM."
+# ---------------------------------------------------------------------------
+# Robust formatting helpers (v2). The old version hid every mke2fs error behind
+# >/dev/null 2>&1, so a failure was impossible to diagnose. Common causes in
+# TWRP: partition still mounted/busy, block device flagged read-only, or a
+# stale filesystem signature. This version fixes all three, tries several
+# mke2fs variants and prints the real error from mke2fs if everything fails.
+# ---------------------------------------------------------------------------
+MKFS_LOG=/tmp/riva-mkfs.log
+: > "$MKFS_LOG"
+
+release_dev() {
+  dev="$1"
+  blockdev --setrw "$dev" >>"$MKFS_LOG" 2>&1 || true
+  swapoff "$dev" 2>/dev/null || true
+  n=0
+  while [ "$n" -lt 4 ]; do
+    n=$((n + 1))
+    found=0
+    while read -r src mp _rest; do
+      case "$src" in /dev/*) ;; *) continue ;; esac
+      real=$(readlink -f "$src" 2>/dev/null)
+      [ -n "$real" ] || real="$src"
+      if [ "$real" = "$dev" ] || [ "$src" = "$dev" ]; then
+        found=1
+        umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || umount -f "$mp" 2>/dev/null || true
+      fi
+    done < /proc/mounts
+    [ "$found" -eq 0 ] && break
+    sleep 1
+  done
+  umount "$dev" 2>/dev/null || true
+}
+
+wipe_dev() {
+  dev="$1"
+  # Destroy stale ext4/F2FS/dm-verity signatures at the start of the partition.
+  dd if=/dev/zero of="$dev" bs=1048576 count=4 conv=fsync >>"$MKFS_LOG" 2>&1 || true
+  sync
+}
+
+find_mkfs_tool() {
+  for t in mke2fs mke2fs.static mkfs.ext2 mkfs.ext4 \
+           /sbin/mke2fs /system/bin/mke2fs /vendor/bin/mke2fs /sbin/mke2fs.static; do
+    p=$(command -v "$t" 2>/dev/null) && [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
+    [ -x "$t" ] && { echo "$t"; return 0; }
+  done
+  return 1
+}
+
+# format_ext <ext2|ext4> <label> <device>
+format_ext() {
+  fs="$1"; label="$2"; dev="$3"
+  tool=$(find_mkfs_tool) || { echo "No mke2fs/mkfs.ext* binary found in this recovery." >>"$MKFS_LOG"; return 1; }
+  echo "tool=$tool fs=$fs label=$label dev=$dev" >>"$MKFS_LOG"
+  release_dev "$dev"
+  wipe_dev "$dev"
+
+  if [ "$fs" = ext2 ]; then
+    # LK2ND can only read plain ext2 (no journal, no extents), so every
+    # fallback below keeps the filesystem ext2-compatible.
+    set -- \
+      "-t ext2 -F -L $label" \
+      "-t ext2 -F -F -L $label" \
+      "-t ext2 -F -F -b 4096 -L $label" \
+      "-t ext2 -F -F -b 4096 -I 128 -O ^resize_inode -L $label" \
+      "-F -F -b 4096 -O none -L $label" \
+      "-t ext4 -F -F -b 4096 -O ^has_journal,^extent,^huge_file,^flex_bg,^metadata_csum,^64bit,^dir_nlink,^extra_isize,^uninit_bg -L $label"
+  else
+    set -- \
+      "-t ext4 -F -L $label" \
+      "-t ext4 -F -F -L $label" \
+      "-t ext4 -F -F -b 4096 -L $label" \
+      "-t ext4 -F -F -b 4096 -O ^metadata_csum,^64bit -L $label" \
+      "-t ext4 -F -F -b 4096 -O ^has_journal -L $label"
+  fi
+
+  for args in "$@"; do
+    case "$(basename "$tool")" in
+      mkfs.ext2|mkfs.ext4) a=$(printf '%s' "$args" | sed 's/-t [a-z0-9]* //') ;;
+      *) a="$args" ;;
+    esac
+    echo "--- trying: $tool $a $dev" >>"$MKFS_LOG"
+    # shellcheck disable=SC2086
+    if "$tool" $a "$dev" </dev/null >>"$MKFS_LOG" 2>&1; then
+      sync
+      echo "--- OK" >>"$MKFS_LOG"
+      return 0
+    fi
+    # The partition may have been re-grabbed by recovery; release it again.
+    release_dev "$dev"
+  done
+  return 1
+}
+
+show_mkfs_log() {
+  ui_print "--- mke2fs diagnostic (last lines) ---"
+  tail -n 8 "$MKFS_LOG" 2>/dev/null | while IFS= read -r line; do ui_print "$line"; done
+  cp "$MKFS_LOG" /tmp/recovery-riva-mkfs.log 2>/dev/null || true
+}
+
+for m in /sdcard /data/media /data /system_root /system; do umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true; done
+release_dev "$SYSTEM_DEV"
+release_dev "$DATA_DEV"
+
+find_mkfs_tool >/dev/null || abort "mke2fs/mkfs.ext4 is missing in this recovery."
+ui_print "Formatting system as ext4..."
+if ! format_ext ext4 ANDROID_SYSTEM "$SYSTEM_DEV"; then
+  show_mkfs_log
+  abort "Could not format system."
+fi
+ui_print "Formatting userdata as ext4..."
+if ! format_ext ext4 ANDROID_DATA "$DATA_DEV"; then
+  show_mkfs_log
+  abort "Could not format userdata."
+fi
+sync
+ui_print " "
+ui_print "Android filesystems are ready."
+ui_print "Next: TWRP Restore your saved Boot, System, Vendor and Data backups."
+ui_print "For a clean crDroid install, do not restore old System/Boot/Data; flash the ROM and its required firmware instead."
+ui_print "This ZIP does not restore GPT, boot images or personal data."
+exit 0

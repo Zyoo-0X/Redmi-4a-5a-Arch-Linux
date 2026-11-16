@@ -1,0 +1,10 @@
+gnome-shell
+gnome-session
+gnome-settings-daemon
+mutter
+nautilus
+xdg-desktop-portal-gnome
+gvfs
+gnome-keyring
+dconf
+xdg-user-dirs

@@ -1,0 +1,17 @@
+networkmanager
+wpa_supplicant
+iw
+sudo
+nano
+usbutils
+evtest
+zram-generator
+kitty
+foot
+mesa
+xorg-xwayland
+noto-fonts
+ttf-dejavu
+jq
+htop
+bash-completion

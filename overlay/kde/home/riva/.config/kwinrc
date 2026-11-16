@@ -1,0 +1,13 @@
+[Wayland]
+InputMethod=/usr/share/applications/org.kde.plasma.keyboard.desktop
+
+[Plugins]
+blurEnabled=false
+contrastEnabled=false
+slidingpopupsEnabled=false
+wobblywindowsEnabled=false
+magiclampEnabled=false
+squashEnabled=false
+
+[Compositing]
+AnimationSpeed=0

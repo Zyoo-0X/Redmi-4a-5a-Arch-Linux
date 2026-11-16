@@ -1,0 +1,6 @@
+[KDE]
+AnimationDurationFactor=0
+SingleClick=false
+
+[KScreen]
+ScaleFactor=1
