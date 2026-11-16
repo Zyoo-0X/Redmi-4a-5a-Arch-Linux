@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Riva UI scale
+Exec=/usr/local/bin/riva-kde-scale
+X-KDE-autostart-phase=2
+NoDisplay=true

@@ -1,0 +1,204 @@
+#!/sbin/sh
+# =====================================================================
+#  Riva Arch Linux installer - Redmi 5A (riva) & Redmi 4A (rolex), OrangeFox / TWRP
+#  Volume Naik  = KDE Plasma minimum (UI dibesarkan)
+#  Volume Turun = GNOME minimum
+#  Memasang ke partition microSD berlabel RIVA_BOOT (p1) + RIVA_ROOT (p2).
+#  TIDAK menulis ke eMMC telefon (boot/recovery/system/data tidak disentuh).
+# =====================================================================
+
+if [ -n "$RIVA_TEST" ]; then OUTFD=/dev/stdout; else OUTFD="/proc/self/fd/$2"; fi
+ZIPFILE="$3"
+BOOT_MNT=/tmp/riva_boot
+ROOT_MNT=/tmp/riva_root
+STAGE=/tmp/riva_stage
+
+ui_print() { printf 'ui_print %s\nui_print\n' "$1" > "$OUTFD"; }
+cleanup() {
+  [ -n "$RIVA_TEST" ] && return 0
+  sync
+  umount "$BOOT_MNT" 2>/dev/null
+  umount "$ROOT_MNT" 2>/dev/null
+  rm -rf "$STAGE"
+}
+abort() { ui_print " "; ui_print "RALAT: $1"; ui_print "Tiada perubahan lanjut dibuat."; cleanup; exit 1; }
+
+get_label() { blkid "$1" 2>/dev/null | sed -n 's/.* LABEL="\([^"]*\)".*/\1/p'; }
+get_partuuid() { blkid "$1" 2>/dev/null | sed -n 's/.* PARTUUID="\([^"]*\)".*/\1/p'; }
+# Cari partition mengikut label, HANYA pada kad luar (mmcblk1+ / sd*), tidak pernah eMMC dalaman mmcblk0.
+find_by_label() {
+  for d in /dev/block/mmcblk[1-9]p[0-9]* /dev/block/sd[a-z][0-9]*; do
+    [ -b "$d" ] || continue
+    [ "$(get_label "$d")" = "$1" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Tunggu butang volum ditekan. Cetak: up | down. Gagal (return 1) jika tidak boleh dikesan.
+wait_key() {
+  if [ -n "$RIVA_TEST" ]; then
+    k=$(head -n1 "$RIVA_TEST_KEYFILE" 2>/dev/null)
+    [ -n "$k" ] || return 1
+    sed -i '1d' "$RIVA_TEST_KEYFILE"; echo "$k"; return 0
+  fi
+  command -v getevent >/dev/null 2>&1 || return 1
+  PAT='KEY_VOLUME(UP|DOWN)[[:space:]]+DOWN|0001 007[23] 00000001'
+  if command -v timeout >/dev/null 2>&1; then
+    ev=$(timeout 120 sh -c "getevent -l 2>/dev/null | grep -m1 -E '$PAT'")
+  else
+    ev=$(getevent -l 2>/dev/null | grep -m1 -E "$PAT")
+  fi
+  case "$ev" in
+    *VOLUMEUP*|*"0001 0073"*) echo up ;;
+    *VOLUMEDOWN*|*"0001 0072"*) echo down ;;
+    *) return 1 ;;
+  esac
+}
+
+ui_print " "
+ui_print "========================================="
+ui_print "  Arch Linux Installer (Redmi 5A / 4A)"
+ui_print "  EKSPERIMEN - belum diuji pada telefon"
+ui_print "========================================="
+
+# --- kesan peranti: riva (Redmi 5A) atau rolex (Redmi 4A)
+PHONE=""
+if [ -n "$RIVA_TEST" ]; then
+  PHONE="$RIVA_TEST_DEVICE"
+else
+  for prop in ro.product.device ro.build.product ro.product.name; do
+    v=$(getprop "$prop" 2>/dev/null)
+    case "$v" in riva|rova|rolex) PHONE="$v"; break ;; esac
+  done
+fi
+case "$PHONE" in rova) PHONE=riva ;; esac
+
+# --- cari partition microSD
+if [ -n "$RIVA_TEST" ]; then
+  ROOT_MNT="$RIVA_TEST_ROOT"; BOOT_MNT="$RIVA_TEST_BOOT"
+else
+  BOOT_DEV=$(find_by_label RIVA_BOOT) || abort "Partition berlabel RIVA_BOOT tiada pada microSD. Sediakan kad dengan scripts/prepare-sd.sh (lihat README)."
+  ROOT_DEV=$(find_by_label RIVA_ROOT) || abort "Partition berlabel RIVA_ROOT tiada pada microSD. Sediakan kad dengan scripts/prepare-sd.sh (lihat README)."
+  ui_print "Boot : $BOOT_DEV (RIVA_BOOT)"
+  ui_print "Root : $ROOT_DEV (RIVA_ROOT)"
+fi
+
+# --- pilihan melalui fail (pilihan): /sdcard/riva-desktop.txt  cth:  "gnome rolex yes"
+DE=""; AUTOYES=""
+for f in /sdcard/riva-desktop.txt /data/media/0/riva-desktop.txt; do
+  if [ -f "$f" ]; then
+    for w in $(cat "$f"); do
+      case "$w" in kde|gnome) DE="$w" ;; riva|rolex) PHONE="$w" ;; yes) AUTOYES=1 ;; esac
+    done
+    break
+  fi
+done
+[ -n "$DE" ] && ui_print "Desktop dari fail: $DE"
+
+# --- pilih peranti jika tidak dapat dikesan
+if [ -z "$PHONE" ]; then
+  ui_print " "
+  ui_print "Peranti tidak dikenali automatik. Pilih model:"
+  ui_print "  [VOLUME NAIK ]  = Redmi 5A (riva)"
+  ui_print "  [VOLUME TURUN]  = Redmi 4A (rolex)"
+  K=$(wait_key) || abort "Peranti tidak dapat dikesan. Letak fail /sdcard/riva-desktop.txt berisi: riva (atau rolex)"
+  case "$K" in up) PHONE=riva ;; down) PHONE=rolex ;; esac
+  [ -z "$RIVA_TEST" ] && sleep 1
+fi
+DTB="msm8917-xiaomi-$PHONE.dtb"
+ui_print "Peranti: $PHONE ($DTB)"
+unzip -l "$ZIPFILE" "boot/$DTB" >/dev/null 2>&1 || abort "Zip ini tiada DTB untuk '$PHONE' (kernel yang dibina belum menyokong peranti itu)."
+
+# --- pilih desktop
+if [ -z "$DE" ]; then
+  ui_print " "
+  ui_print "Pilih desktop:"
+  ui_print "  [VOLUME NAIK ]  = KDE Plasma minimum (UI besar)"
+  ui_print "  [VOLUME TURUN]  = GNOME minimum"
+  K=$(wait_key) || abort "Butang volum tidak dapat dikesan. Letak fail /sdcard/riva-desktop.txt berisi: kde  (atau: gnome)"
+  case "$K" in up) DE=kde ;; down) DE=gnome ;; esac
+  ui_print "-> $DE dipilih"
+  [ -z "$RIVA_TEST" ] && sleep 1
+fi
+
+# --- pengesahan (partition root akan DIPADAM)
+if [ -z "$AUTOYES" ]; then
+  ui_print " "
+  ui_print "AMARAN: SEMUA data pada RIVA_ROOT akan DIPADAM."
+  ui_print "  [VOLUME NAIK ]  = TERUSKAN pasang $DE"
+  ui_print "  [VOLUME TURUN]  = BATAL"
+  K=$(wait_key) || abort "Tiada pengesahan diterima."
+  [ "$K" = up ] || abort "Dibatalkan oleh pengguna."
+fi
+
+# --- semak alat
+command -v xz >/dev/null 2>&1 || command -v unxz >/dev/null 2>&1 || abort "xz tiada dalam recovery ini."
+command -v unzip >/dev/null 2>&1 || abort "unzip tiada dalam recovery ini."
+unzip -l "$ZIPFILE" "rootfs-$DE.tar.xz" >/dev/null 2>&1 || abort "rootfs-$DE.tar.xz tiada dalam zip ini."
+
+# --- format + mount
+if [ -z "$RIVA_TEST" ]; then
+  umount "$ROOT_DEV" 2>/dev/null; umount "$BOOT_DEV" 2>/dev/null
+  mkdir -p "$ROOT_MNT" "$BOOT_MNT"
+  ui_print " "; ui_print "Memformat RIVA_ROOT (ext4)..."
+  if command -v mke2fs >/dev/null 2>&1; then
+    mke2fs -t ext4 -F -L RIVA_ROOT "$ROOT_DEV" >/dev/null 2>&1 || abort "mke2fs gagal."
+  elif command -v mkfs.ext4 >/dev/null 2>&1; then
+    mkfs.ext4 -F -L RIVA_ROOT "$ROOT_DEV" >/dev/null 2>&1 || abort "mkfs.ext4 gagal."
+  else
+    ui_print "mke2fs tiada - kandungan lama akan dipadam melalui rm."
+  fi
+  mount -t ext4 "$ROOT_DEV" "$ROOT_MNT" || abort "Gagal mount RIVA_ROOT."
+  mount -t ext2 "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null || mount "$BOOT_DEV" "$BOOT_MNT" || abort "Gagal mount RIVA_BOOT."
+else
+  mkdir -p "$ROOT_MNT" "$BOOT_MNT"
+fi
+find "$ROOT_MNT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
+# --- ekstrak rootfs
+TAR_OPTS="-xp --numeric-owner"
+tar --help 2>&1 | grep -q xattrs && TAR_OPTS="$TAR_OPTS --xattrs --xattrs-include=*"
+tar --help 2>&1 | grep -q -- --acls && TAR_OPTS="$TAR_OPTS --acls"
+ui_print "Mengekstrak rootfs-$DE (ambil masa 10-30 minit, jangan matikan telefon)..."
+# shellcheck disable=SC2086
+unzip -p "$ZIPFILE" "rootfs-$DE.tar.xz" | xz -dc | tar $TAR_OPTS -C "$ROOT_MNT" \
+  || abort "Pengekstrakan gagal (kad rosak / ruang tidak cukup / zip rosak)."
+[ "$(cat "$ROOT_MNT/etc/riva-release" 2>/dev/null)" = "$DE" ] || abort "Pengesahan rootfs gagal (etc/riva-release tidak sepadan)."
+[ -e "$ROOT_MNT/usr/bin/bash" ] || abort "Pengesahan rootfs gagal (usr/bin/bash tiada)."
+
+# --- fail boot
+ui_print "Menyalin kernel + DTB + extlinux..."
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+unzip -o "$ZIPFILE" 'boot/*' -d "$STAGE" >/dev/null || abort "Gagal ekstrak fail boot."
+find "$BOOT_MNT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+cp "$STAGE/boot/Image" "$BOOT_MNT/" || abort "Gagal salin kernel (ruang RIVA_BOOT?)."
+cp "$STAGE"/boot/*.dtb "$BOOT_MNT/" || abort "Gagal salin DTB."
+cp "$STAGE/boot/lk2nd-msm8952.img" "$BOOT_MNT/" 2>/dev/null
+mkdir -p "$BOOT_MNT/extlinux"
+
+if [ -n "$RIVA_TEST" ]; then ROOTARG="root=/dev/mmcblk1p2"
+else
+  PU=$(get_partuuid "$ROOT_DEV")
+  if [ -n "$PU" ]; then ROOTARG="root=PARTUUID=$PU"; else ROOTARG="root=/dev/$(basename "$ROOT_DEV")"; fi
+fi
+cat > "$BOOT_MNT/extlinux/extlinux.conf" <<CONF
+default riva-arch
+label riva-arch
+    menu label Arch Linux ARM ($DE, $PHONE)
+    linux /Image
+    fdt /$DTB
+    append $ROOTARG rootfstype=ext4 rw rootwait console=tty0 loglevel=4
+CONF
+
+# --- salinan lk2nd untuk PC (kekal pada storan dalaman)
+if [ -z "$RIVA_TEST" ] && [ -d /sdcard ]; then
+  mkdir -p /sdcard/RIVA && cp "$STAGE/boot/lk2nd-msm8952.img" /sdcard/RIVA/ 2>/dev/null
+fi
+
+cleanup
+ui_print " "
+ui_print "SIAP: Arch Linux ($DE) dipasang pada microSD."
+ui_print "Seterusnya: sambung ke PC, masuk fastboot (Kuasa + Vol Turun) dan jalankan:"
+ui_print "  fastboot boot lk2nd-msm8952.img"
+ui_print "Telefon boleh dibuang dari Arch dengan hanya tidak memasukkan kad / reboot biasa."
+exit 0

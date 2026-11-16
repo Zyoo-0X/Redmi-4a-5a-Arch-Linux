@@ -1,0 +1,14 @@
+#!/bin/sh
+# riva-gfx [gpu|software|status]
+# Tukar mod grafik seluruh sesi. Log keluar dan masuk semula (atau reboot) selepas tukar.
+F=/etc/environment.d/91-riva-gfx.conf
+case "${1:-status}" in
+  software)
+    printf 'LIBGL_ALWAYS_SOFTWARE=1\nGALLIUM_DRIVER=llvmpipe\n' | sudo tee "$F" >/dev/null
+    echo "Mod: software (llvmpipe). Reboot untuk berkuat kuasa." ;;
+  gpu)
+    sudo rm -f "$F"; echo "Mod: GPU (freedreno). Reboot untuk berkuat kuasa." ;;
+  status)
+    if [ -f "$F" ]; then echo "software"; else echo "gpu"; fi ;;
+  *) echo "guna: riva-gfx [gpu|software|status]"; exit 1 ;;
+esac

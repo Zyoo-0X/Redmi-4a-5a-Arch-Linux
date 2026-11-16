@@ -1,0 +1,8 @@
+#!/bin/sh
+# Adreno 308 (freedreno a3xx) mungkin tidak menawarkan OpenGL 3.3 yang diperlukan
+# kitty. Render perisian (llvmpipe) untuk terminal itu ringan dan stabil.
+# Letak RIVA_KITTY_GPU=1 untuk cuba GPU.
+if [ "${RIVA_KITTY_GPU:-0}" != "1" ]; then
+  export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+fi
+exec /usr/bin/kitty "$@"

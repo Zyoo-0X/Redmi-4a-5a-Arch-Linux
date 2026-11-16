@@ -1,0 +1,7 @@
+plasma-desktop
+plasma-nm
+kscreen
+powerdevil
+dolphin
+qt6-wayland
+xdg-desktop-portal-kde

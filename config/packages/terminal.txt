@@ -1,0 +1,13 @@
+networkmanager
+wpa_supplicant
+iw
+sudo
+nano
+usbutils
+evtest
+zram-generator
+htop
+bash-completion
+less
+man-db
+linux-firmware-qcom

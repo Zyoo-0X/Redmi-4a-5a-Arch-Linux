@@ -1,0 +1,188 @@
+name: Build Riva Native Arch and Android Restore ZIPs
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop:
+        description: "One root filesystem per Arch ZIP (keeps the release asset below 2 GB)"
+        type: choice
+        required: true
+        default: kde
+        options:
+          - terminal
+          - kde
+          - gnome
+      kernel_mode:
+        description: "Reuse the previous Redmi 5A kernel artifact, or rebuild it"
+        type: choice
+        required: true
+        default: reuse
+        options:
+          - reuse
+          - rebuild
+      kernel_run_id:
+        description: "Previous run ID containing riva-kernel artifact"
+        type: string
+        required: false
+        default: "43776391004"
+      rootfs_run_id:
+        description: "Previous run ID containing the existing KDE/GNOME rootfs artifacts"
+        type: string
+        required: false
+        default: "43783592362"
+      publish_release:
+        description: "Publish both flashable ZIPs as a GitHub Release"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl device-tree-compiler \
+            flex gcc-aarch64-linux-gnu gcc-arm-none-eabi git jq libelf-dev libfdt-dev \
+            libssl-dev make python3 qemu-user-static binfmt-support xz-utils zstd \
+            unzip zip shellcheck
+          sudo update-binfmts --enable qemu-aarch64 || true
+          mkdir -p out
+
+      - name: Download previous kernel artifact
+        if: ${{ inputs.kernel_mode == 'reuse' && inputs.kernel_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: riva-kernel
+          path: .
+          run-id: ${{ inputs.kernel_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Restore previous kernel files
+        id: reuse_kernel
+        if: ${{ inputs.kernel_mode == 'reuse' && inputs.kernel_run_id != '' }}
+        run: |
+          if [[ -s riva-kernel.tar ]]; then
+            tar -C out -xf riva-kernel.tar
+            if [[ -s out/boot/Image && -s out/boot/msm8917-xiaomi-riva.dtb && -s out/kernel/modules.tar.xz && -s out/kernel/INFO && -s out/kernel/config ]]; then
+              echo "reused=true" >> "$GITHUB_OUTPUT"
+              echo "Previous Redmi 5A kernel artifact restored."
+            else
+              rm -f riva-kernel.tar
+              rm -rf out/boot out/kernel
+              mkdir -p out/boot out/kernel
+              echo "reused=false" >> "$GITHUB_OUTPUT"
+              echo "Previous kernel artifact was incomplete; a new kernel will be built."
+            fi
+          else
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+            echo "Kernel artifact unavailable; a new kernel will be built."
+          fi
+
+      - name: Build kernel if missing or rebuild requested
+        env:
+          KERNEL_MODE: ${{ inputs.kernel_mode }}
+        run: |
+          if [[ "$KERNEL_MODE" == rebuild || ! -s out/boot/Image || ! -s out/boot/msm8917-xiaomi-riva.dtb || ! -s out/kernel/modules.tar.xz ]]; then
+            bash scripts/build-kernel.sh
+          fi
+          test -s out/boot/Image
+          test -s out/boot/msm8917-xiaomi-riva.dtb
+          test -s out/kernel/modules.tar.xz
+
+      - name: Download selected previous rootfs artifact
+        if: ${{ inputs.desktop != 'terminal' && inputs.rootfs_run_id != '' && steps.reuse_kernel.outputs.reused == 'true' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: riva-rootfs-${{ inputs.desktop }}
+          path: out
+          run-id: ${{ inputs.rootfs_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify rootfs modules match the selected kernel, then build if needed
+        env:
+          DESKTOP: ${{ inputs.desktop }}
+        run: |
+          ROOTFS="out/rootfs-${DESKTOP}.tar.xz"
+          KREL="$(sed -n 's/^release=//p' out/kernel/INFO | head -n1)"
+          if [[ -s "$ROOTFS" ]]; then
+            LIST="out/rootfs-${DESKTOP}-file-list.txt"
+            tar -tJf "$ROOTFS" > "$LIST"
+            if [[ -z "$KREL" ]] || ! grep -Fq "usr/lib/modules/${KREL}/" "$LIST"; then
+              echo "Selected rootfs does not contain modules for kernel ${KREL}; rebuilding it."
+              rm -f "$ROOTFS"
+            else
+              echo "Reusing ${DESKTOP} rootfs with matching modules for ${KREL}."
+            fi
+            rm -f "$LIST"
+          fi
+          if [[ ! -s "$ROOTFS" ]]; then
+            bash scripts/build-rootfs.sh "$DESKTOP"
+          fi
+          test -s "$ROOTFS"
+
+      - name: Build custom LK2ND for the existing kernel image size
+        run: bash scripts/build-lk2nd.sh
+
+      - name: Check scripts
+        run: |
+          shellcheck -S warning scripts/*.sh installer/arch/META-INF/com/google/android/update-binary installer/restore/META-INF/com/google/android/update-binary || true
+          bash -n scripts/*.sh
+          sh -n installer/arch/META-INF/com/google/android/update-binary
+          sh -n installer/restore/META-INF/com/google/android/update-binary
+
+      - name: Build the single-desktop Arch boot ZIP
+        env:
+          DESKTOP: ${{ inputs.desktop }}
+        run: bash scripts/package-internal-boot.sh
+
+      - name: Build Android restore ZIP
+        run: bash scripts/package-android-restore.sh
+
+      - name: Check output sizes and ZIP integrity
+        run: |
+          stat -c '%n %s bytes' out/Riva-Arch-Boot.zip out/Riva-Android-Restore.zip
+          test "$(stat -c %s out/Riva-Arch-Boot.zip)" -lt 1900000000
+          unzip -t out/Riva-Arch-Boot.zip >/dev/null
+          unzip -t out/Riva-Android-Restore.zip >/dev/null
+
+      - name: Upload flashable ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: riva-flashable-zips-${{ inputs.desktop }}
+          path: |
+            out/Riva-Arch-Boot.zip
+            out/Riva-Arch-Boot.zip.sha256
+            out/Riva-Android-Restore.zip
+            out/Riva-Android-Restore.zip.sha256
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DESKTOP: ${{ inputs.desktop }}
+        run: |
+          TAG="riva-native-$(date -u +%Y%m%d-%H%M)-${DESKTOP}"
+          gh release create "$TAG" \
+            out/Riva-Arch-Boot.zip out/Riva-Arch-Boot.zip.sha256 \
+            out/Riva-Android-Restore.zip out/Riva-Android-Restore.zip.sha256 \
+            --title "Riva Native Arch + Android Restore (${DESKTOP})" \
+            --notes-file README.md --prerelease

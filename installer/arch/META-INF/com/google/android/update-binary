@@ -1,0 +1,170 @@
+#!/sbin/sh
+# Riva Native Arch Linux installer for Xiaomi Redmi 5A (riva).
+# Uses existing Android partitions: system -> ext2 boot-filesystem, userdata -> ext4 rootfs.
+# Does NOT rewrite GPT and does NOT touch recovery/vendor/persist/modem partitions.
+
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+STAGE="/tmp/riva-arch-stage"
+BOOT_MNT="/tmp/riva-arch-boot"
+ROOT_MNT="/tmp/riva-arch-root"
+
+ui_print() { printf 'ui_print %s\nui_print\n' "$1" > "$OUTFD"; }
+case "$ZIPFILE" in /sdcard/*|/data/*|/storage/emulated/*) ui_print "ERROR: This ZIP formats userdata. Flash through ADB Sideload or USB OTG, not internal storage."; exit 1 ;; esac
+cleanup() {
+  umount "$BOOT_MNT" 2>/dev/null || true
+  umount "$ROOT_MNT" 2>/dev/null || true
+  rm -rf "$STAGE"
+}
+abort() { ui_print "ERROR: $1"; ui_print "The installation stopped. If formatting already started, use the Android Restore ZIP and your external TWRP backup."; cleanup; exit 1; }
+
+find_part() {
+  part="$1"
+  for base in /dev/block/bootdevice/by-name /dev/block/platform/*/by-name /dev/block/by-name; do
+    candidate="$base/$part"
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    resolved=$(readlink -f "$candidate" 2>/dev/null)
+    [ -n "$resolved" ] || resolved="$candidate"
+    [ -b "$resolved" ] && { echo "$resolved"; return 0; }
+  done
+  return 1
+}
+part_sectors() { blockdev --getsz "$1" 2>/dev/null || echo 0; }
+part_size() { blockdev --getsize64 "$1" 2>/dev/null || echo 0; }
+
+ui_print " "
+ui_print "Riva Native Arch Linux Installer"
+ui_print "Target: Xiaomi Redmi 5A (riva)"
+ui_print " "
+
+# Device guard: do not run this package on Redmi 4A or unrelated devices.
+DEVICE=""
+for key in ro.product.device ro.build.product ro.product.name; do
+  value=$(getprop "$key" 2>/dev/null)
+  case "$value" in riva|riva_in) DEVICE=riva; break ;; esac
+done
+[ "$DEVICE" = riva ] || abort "Device is not identified as Redmi 5A (riva). Detected: ${value:-unknown}."
+
+[ -b /dev/block/mmcblk0 ] || abort "Internal eMMC /dev/block/mmcblk0 not found."
+command -v unzip >/dev/null 2>&1 || abort "unzip is missing in this recovery."
+command -v xz >/dev/null 2>&1 || abort "xz is missing in this recovery."
+command -v tar >/dev/null 2>&1 || abort "tar is missing in this recovery."
+command -v dd >/dev/null 2>&1 || abort "dd is missing in this recovery."
+command -v blockdev >/dev/null 2>&1 || abort "blockdev is missing in this recovery."
+
+SYSTEM_DEV=$(find_part system) || abort "Cannot find the Android system partition by-name/system."
+DATA_DEV=$(find_part userdata) || abort "Cannot find the Android userdata partition by-name/userdata."
+BOOT_DEV=$(find_part boot) || abort "Cannot find the Android boot partition by-name/boot."
+
+# Strict eMMC guard. Never accept a path outside the internal mmcblk0 device.
+case "$SYSTEM_DEV" in /dev/block/mmcblk0p*) ;; *) abort "system did not resolve to an mmcblk0 partition: $SYSTEM_DEV" ;; esac
+case "$DATA_DEV" in /dev/block/mmcblk0p*) ;; *) abort "userdata did not resolve to an mmcblk0 partition: $DATA_DEV" ;; esac
+case "$BOOT_DEV" in /dev/block/mmcblk0p*) ;; *) abort "boot did not resolve to an mmcblk0 partition: $BOOT_DEV" ;; esac
+[ "$SYSTEM_DEV" != "$DATA_DEV" ] && [ "$SYSTEM_DEV" != "$BOOT_DEV" ] && [ "$DATA_DEV" != "$BOOT_DEV" ] || abort "Partition aliases overlap."
+
+SYSTEM_SECTORS=$(part_sectors "$SYSTEM_DEV")
+DATA_SECTORS=$(part_sectors "$DATA_DEV")
+BOOT_SIZE=$(part_size "$BOOT_DEV")
+[ "$SYSTEM_SECTORS" -ge 131072 ] || abort "System partition is smaller than 64 MiB."
+[ "$DATA_SECTORS" -ge 4194304 ] || abort "Userdata partition is smaller than 2 GiB."
+
+# Read selected desktop and the uncompressed rootfs size from build metadata.
+BUILD_INFO="$STAGE/BUILD-INFO.txt"
+mkdir -p "$STAGE" || abort "Cannot create temporary stage."
+unzip -p "$ZIPFILE" BUILD-INFO.txt > "$BUILD_INFO" 2>/dev/null || abort "BUILD-INFO.txt missing."
+DESKTOP=$(sed -n 's/^desktop=//p' "$BUILD_INFO" | head -n1)
+ROOTFS_UNCOMPRESSED_SECTORS=$(sed -n 's/^rootfs_uncompressed_sectors=//p' "$BUILD_INFO" | head -n1)
+case "$DESKTOP" in terminal|kde|gnome) ;; *) abort "Unknown desktop profile in installer." ;; esac
+case "$ROOTFS_UNCOMPRESSED_SECTORS" in ''|*[!0-9]*) abort "Invalid rootfs size in installer metadata." ;; esac
+ROOTFS_ENTRY="rootfs-${DESKTOP}.tar.xz"
+unzip -l "$ZIPFILE" "$ROOTFS_ENTRY" >/dev/null 2>&1 || abort "$ROOTFS_ENTRY is missing from this installer."
+unzip -t "$ZIPFILE" >/dev/null 2>&1 || abort "Installer ZIP integrity check failed."
+# Validate the compressed rootfs before formatting Android partitions.
+unzip -p "$ZIPFILE" "$ROOTFS_ENTRY" | xz -t >/dev/null 2>&1 || abort "Rootfs archive integrity check failed."
+unzip -o "$ZIPFILE" 'boot/*' -d "$STAGE" >/dev/null 2>&1 || abort "Could not extract boot files."
+[ -s "$STAGE/boot/Image" ] || abort "Kernel Image is missing."
+[ -s "$STAGE/boot/msm8917-xiaomi-riva.dtb" ] || abort "Redmi 5A DTB is missing."
+[ -s "$STAGE/boot/lk2nd-riva.img" ] || abort "LK2ND image is missing."
+REQUIRED_SECTORS=$((ROOTFS_UNCOMPRESSED_SECTORS + 1048576))
+[ "$DATA_SECTORS" -ge "$REQUIRED_SECTORS" ] || abort "Not enough userdata space. Required sectors: $REQUIRED_SECTORS; available: $DATA_SECTORS."
+[ "$BOOT_SIZE" -ge 8388608 ] || abort "Boot partition is too small for lk2nd."
+
+ui_print "Selected desktop: $DESKTOP"
+ui_print "system: $SYSTEM_DEV ($SYSTEM_SECTORS sectors)"
+ui_print "userdata: $DATA_DEV ($DATA_SECTORS sectors)"
+ui_print "boot: $BOOT_DEV ($BOOT_SIZE bytes)"
+ui_print " "
+ui_print "WARNING: This erases Android SYSTEM and USERDATA, and replaces BOOT with LK2ND."
+ui_print "Your TWRP backup must already be copied to a PC or USB OTG."
+ui_print "The GPT and partition sizes are NOT changed."
+ui_print "Recovery, vendor, persist and modem partitions are not formatted."
+ui_print "Starting installation..."
+
+# Unmount only partitions that will be reformatted.
+for m in /sdcard /data/media /data /system_root /system; do umount "$m" 2>/dev/null || true; done
+umount "$SYSTEM_DEV" 2>/dev/null || true
+umount "$DATA_DEV" 2>/dev/null || true
+
+MKFS_EXT2=$(command -v mke2fs || command -v mkfs.ext2 || true)
+MKFS_EXT4=$(command -v mke2fs || command -v mkfs.ext4 || true)
+[ -n "$MKFS_EXT2" ] || abort "mke2fs or mkfs.ext2 is missing in this recovery."
+[ -n "$MKFS_EXT4" ] || abort "mke2fs or mkfs.ext4 is missing in this recovery."
+
+ui_print "Formatting system as ext2 (LK2ND extlinux filesystem)..."
+if [ "$(basename "$MKFS_EXT2")" = mke2fs ]; then
+  "$MKFS_EXT2" -t ext2 -F -L RIVA_BOOT "$SYSTEM_DEV" >/dev/null 2>&1 || abort "Could not format system as ext2."
+else
+  "$MKFS_EXT2" -F -L RIVA_BOOT "$SYSTEM_DEV" >/dev/null 2>&1 || abort "Could not format system as ext2."
+fi
+ui_print "Formatting userdata as ext4 (Arch Linux root filesystem)..."
+if [ "$(basename "$MKFS_EXT4")" = mke2fs ]; then
+  "$MKFS_EXT4" -t ext4 -F -L RIVA_ROOT "$DATA_DEV" >/dev/null 2>&1 || abort "Could not format userdata as ext4."
+else
+  "$MKFS_EXT4" -F -L RIVA_ROOT "$DATA_DEV" >/dev/null 2>&1 || abort "Could not format userdata as ext4."
+fi
+
+mkdir -p "$BOOT_MNT" "$ROOT_MNT"
+mount -t ext2 "$SYSTEM_DEV" "$BOOT_MNT" || abort "Could not mount the new system boot-filesystem."
+mount -t ext4 "$DATA_DEV" "$ROOT_MNT" || abort "Could not mount the new userdata root filesystem."
+
+ui_print "Extracting Arch Linux ($DESKTOP). This can take a while..."
+TAR_OPTS="-xpf - --numeric-owner --same-owner"
+if tar --help 2>&1 | grep -q -- '--xattrs'; then TAR_OPTS="$TAR_OPTS --xattrs --xattrs-include=*"; fi
+if tar --help 2>&1 | grep -q -- '--acls'; then TAR_OPTS="$TAR_OPTS --acls"; fi
+# shellcheck disable=SC2086
+unzip -p "$ZIPFILE" "$ROOTFS_ENTRY" | xz -dc | tar $TAR_OPTS -C "$ROOT_MNT" || abort "Root filesystem extraction failed."
+[ -e "$ROOT_MNT/usr/bin/bash" ] || abort "Rootfs check failed: /usr/bin/bash is missing."
+[ "$(cat "$ROOT_MNT/etc/riva-release" 2>/dev/null)" = "$DESKTOP" ] || abort "Rootfs profile check failed."
+
+ui_print "Installing kernel, DTB and LK2ND boot files..."
+LK_SIZE=$(wc -c < "$STAGE/boot/lk2nd-riva.img")
+[ "$BOOT_SIZE" -gt "$LK_SIZE" ] || abort "LK2ND image is larger than the boot partition."
+cp "$STAGE/boot/Image" "$BOOT_MNT/Image" || abort "Could not copy kernel Image."
+cp "$STAGE/boot/msm8917-xiaomi-riva.dtb" "$BOOT_MNT/msm8917-xiaomi-riva.dtb" || abort "Could not copy Redmi 5A DTB."
+mkdir -p "$BOOT_MNT/extlinux"
+
+PARTUUID=""
+if command -v blkid >/dev/null 2>&1; then
+  PARTUUID=$(blkid -s PARTUUID -o value "$DATA_DEV" 2>/dev/null | head -n1)
+fi
+if [ -n "$PARTUUID" ]; then ROOT_ARG="root=PARTUUID=$PARTUUID"; else ROOT_ARG="root=/dev/$(basename "$DATA_DEV")"; fi
+cat > "$BOOT_MNT/extlinux/extlinux.conf" <<CONF
+default riva-arch
+label riva-arch
+    menu label Arch Linux ARM ($DESKTOP)
+    linux /Image
+    fdt /msm8917-xiaomi-riva.dtb
+    append $ROOT_ARG rootfstype=ext4 rw rootwait console=tty0 loglevel=4
+CONF
+
+# Flash only LK2ND into Android boot. Keep the recovery partition intact.
+dd if="$STAGE/boot/lk2nd-riva.img" of="$BOOT_DEV" bs=4096 conv=fsync >/dev/null 2>&1 || abort "Could not write LK2ND to boot partition."
+sync
+umount "$BOOT_MNT" 2>/dev/null || true
+umount "$ROOT_MNT" 2>/dev/null || true
+ui_print " "
+ui_print "Arch Linux installation completed."
+ui_print "Reboot System. LK2ND should load extlinux from the former system partition."
+ui_print "To return to Android: boot recovery, flash Riva-Android-Restore.zip, then restore your TWRP backup."
+cleanup
+exit 0

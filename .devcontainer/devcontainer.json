@@ -1,0 +1,6 @@
+{
+  "name": "Riva Arch Linux Builder",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends bc bison build-essential ca-certificates cpio curl device-tree-compiler flex gcc-aarch64-linux-gnu gcc-arm-none-eabi git libelf-dev libfdt-dev libssl-dev make qemu-user-static binfmt-support xz-utils zstd unzip zip jq shellcheck",
+  "customizations": { "vscode": { "extensions": [ "timonwong.shellcheck" ] } }
+}

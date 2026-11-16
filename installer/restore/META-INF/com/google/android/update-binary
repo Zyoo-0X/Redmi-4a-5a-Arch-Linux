@@ -1,0 +1,70 @@
+#!/sbin/sh
+# Riva Android Restore Prep. Restores Android filesystems, not the GPT.
+# It intentionally leaves boot/recovery/vendor/persist/modem partitions untouched.
+
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+ui_print() { printf 'ui_print %s\nui_print\n' "$1" > "$OUTFD"; }
+case "$ZIPFILE" in /sdcard/*|/data/*|/storage/emulated/*) ui_print "ERROR: This ZIP formats userdata. Flash through ADB Sideload or USB OTG, not internal storage."; exit 1 ;; esac
+abort() { ui_print "ERROR: $1"; ui_print "If formatting has begun, do not reboot to Android; repeat this ZIP only after checking recovery logs."; exit 1; }
+find_part() {
+  part="$1"
+  for base in /dev/block/bootdevice/by-name /dev/block/platform/*/by-name /dev/block/by-name; do
+    candidate="$base/$part"
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    resolved=$(readlink -f "$candidate" 2>/dev/null)
+    [ -n "$resolved" ] || resolved="$candidate"
+    [ -b "$resolved" ] && { echo "$resolved"; return 0; }
+  done
+  return 1
+}
+
+ui_print " "
+ui_print "Riva Android Restore Prep"
+ui_print "Target: Xiaomi Redmi 5A (riva)"
+ui_print " "
+DEVICE=""
+for key in ro.product.device ro.build.product ro.product.name; do
+  value=$(getprop "$key" 2>/dev/null)
+  case "$value" in riva|riva_in) DEVICE=riva; break ;; esac
+done
+[ "$DEVICE" = riva ] || abort "Device is not identified as Redmi 5A (riva)."
+[ -b /dev/block/mmcblk0 ] || abort "Internal eMMC is missing."
+SYSTEM_DEV=$(find_part system) || abort "Cannot find by-name/system."
+DATA_DEV=$(find_part userdata) || abort "Cannot find by-name/userdata."
+case "$SYSTEM_DEV" in /dev/block/mmcblk0p*) ;; *) abort "system is not on internal eMMC." ;; esac
+case "$DATA_DEV" in /dev/block/mmcblk0p*) ;; *) abort "userdata is not on internal eMMC." ;; esac
+[ "$SYSTEM_DEV" != "$DATA_DEV" ] || abort "system and userdata aliases overlap."
+SYSTEM_SECTORS=$(blockdev --getsz "$SYSTEM_DEV" 2>/dev/null || echo 0)
+DATA_SECTORS=$(blockdev --getsz "$DATA_DEV" 2>/dev/null || echo 0)
+[ "$SYSTEM_SECTORS" -ge 131072 ] || abort "System partition size is invalid."
+[ "$DATA_SECTORS" -ge 4194304 ] || abort "Userdata partition size is invalid."
+
+ui_print "This will erase the Linux root filesystem and boot files."
+ui_print "The GPT layout is unchanged; the original Android partitions are reused."
+ui_print "After this ZIP, restore your TWRP backup OR flash an Android ROM."
+for m in /sdcard /data/media /data /system_root /system; do umount "$m" 2>/dev/null || true; done
+umount "$SYSTEM_DEV" 2>/dev/null || true
+umount "$DATA_DEV" 2>/dev/null || true
+
+MKFS=$(command -v mke2fs || command -v mkfs.ext4 || true)
+[ -n "$MKFS" ] || abort "mke2fs/mkfs.ext4 is missing in this recovery."
+ui_print "Formatting system as ext4..."
+if [ "$(basename "$MKFS")" = mke2fs ]; then
+  "$MKFS" -t ext4 -F -L ANDROID_SYSTEM "$SYSTEM_DEV" >/dev/null 2>&1 || abort "Could not format system."
+else
+  "$MKFS" -F -L ANDROID_SYSTEM "$SYSTEM_DEV" >/dev/null 2>&1 || abort "Could not format system."
+fi
+ui_print "Formatting userdata as ext4..."
+if [ "$(basename "$MKFS")" = mke2fs ]; then
+  "$MKFS" -t ext4 -F -L ANDROID_DATA "$DATA_DEV" >/dev/null 2>&1 || abort "Could not format userdata."
+else
+  "$MKFS" -F -L ANDROID_DATA "$DATA_DEV" >/dev/null 2>&1 || abort "Could not format userdata."
+fi
+sync
+ui_print " "
+ui_print "Android filesystems are ready."
+ui_print "Next: TWRP Restore your saved Boot, System, Vendor and Data backups."
+ui_print "For a clean crDroid install, do not restore old System/Boot/Data; flash the ROM and its required firmware instead."
+ui_print "This ZIP does not restore GPT, boot images or personal data."
+exit 0
